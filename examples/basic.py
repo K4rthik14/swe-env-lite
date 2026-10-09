@@ -8,7 +8,11 @@ from swe_env.types import SWEAction
 
 def main() -> None:
     repo_path = Path(__file__).resolve().parents[1]
-    env = SWEEnv(repo_path=repo_path, max_steps=1)
+    with SWEEnv(repo_path=repo_path, max_steps=1) as env:
+        run_example(env)
+
+
+def run_example(env: SWEEnv) -> None:
     observation, info = env.reset()
 
     print("Initial workspace entries")

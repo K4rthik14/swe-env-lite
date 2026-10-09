@@ -37,7 +37,8 @@ def test_step_runs_in_repo_and_returns_step_result(tmp_path: Path) -> None:
     result = env.step(SWEAction(command))
 
     assert isinstance(result, StepResult)
-    assert result.observation.stdout.strip() == str(tmp_path.resolve())
+    assert result.observation.stdout.strip() == str(env._workspace.path)
+    assert env._workspace.path != tmp_path.resolve()
     assert result.observation.exit_code == 0
     assert result.reward == 0.0
     assert result.terminated is False
@@ -49,6 +50,7 @@ def test_step_runs_in_repo_and_returns_step_result(tmp_path: Path) -> None:
 def test_nonzero_exit_captures_output_and_has_failure_reward(tmp_path: Path) -> None:
     env = SWEEnv(tmp_path)
 
+    env.reset()
     result = env.step(_python("import sys; print('failed', file=sys.stderr); sys.exit(3)"))
 
     assert result.observation.stderr.strip() == "failed"
@@ -59,6 +61,7 @@ def test_nonzero_exit_captures_output_and_has_failure_reward(tmp_path: Path) -> 
 def test_timeout_is_reported_as_command_failure(tmp_path: Path) -> None:
     env = SWEEnv(tmp_path, command_timeout=0.05)
 
+    env.reset()
     result = env.step(_python("import time; time.sleep(2)"))
 
     assert result.observation.exit_code == 124
@@ -81,6 +84,7 @@ def test_git_diff_reports_tracked_changes_without_resetting_repo(tmp_path: Path)
     subprocess.run(["git", "commit", "--quiet", "-m", "fixture"], cwd=tmp_path, check=True)
     env = SWEEnv(tmp_path)
 
+    env.reset()
     result = env.step(
         _python("from pathlib import Path; Path('tracked.txt').write_text('after\\n')")
     )
@@ -88,12 +92,13 @@ def test_git_diff_reports_tracked_changes_without_resetting_repo(tmp_path: Path)
     assert result.info["git_available"] is True
     assert "tracked.txt" in result.observation.diff
     assert "+after" in result.observation.diff
-    assert source.read_text(encoding="utf-8") == "after\n"
+    assert source.read_text(encoding="utf-8") == "before\n"
 
 
 def test_episode_limit_truncates_until_reset(tmp_path: Path) -> None:
     env = SWEEnv(tmp_path, max_steps=1)
 
+    env.reset()
     result = env.step("true")
 
     assert result.truncated is True
@@ -107,5 +112,6 @@ def test_invalid_path_and_action_are_rejected(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         SWEEnv(tmp_path / "missing")
     env = SWEEnv(tmp_path)
+    env.reset()
     with pytest.raises(ValueError, match="empty"):
         env.step("  ")

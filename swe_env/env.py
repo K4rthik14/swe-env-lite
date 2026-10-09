@@ -2,49 +2,52 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 from pathlib import Path
 from typing import Union
 
+from .executor import execute
 from .types import StepResult, SWEAction, SWEObservation
+from .workspace import EpisodeWorkspace
 
 
 class SWEEnv:
-    """Run explicitly supplied shell commands with a repository as their cwd.
-
-    Commands run with the current user's permissions. This class does not
-    sandbox commands, reset the repository, or decide whether a task is solved.
-    """
+    """Run commands in a disposable copy of a repository, not a security sandbox."""
 
     def __init__(
         self,
         repo_path: Union[str, Path],
         command_timeout: float = 30.0,
         max_steps: int = 20,
+        output_limit_bytes: int = 1_000_000,
     ) -> None:
-        path = Path(repo_path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"Repository path does not exist: {path}")
-        if not path.is_dir():
-            raise ValueError(f"Repository path must be a directory: {path}")
-        if command_timeout <= 0:
-            raise ValueError("command_timeout must be positive")
-        if max_steps < 1:
+        workspace = EpisodeWorkspace(repo_path)
+        if (isinstance(command_timeout, bool) or not isinstance(command_timeout, (int, float))
+                or not math.isfinite(command_timeout) or command_timeout <= 0):
+            raise ValueError("command_timeout must be a finite positive number")
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
             raise ValueError("max_steps must be at least 1")
+        if (isinstance(output_limit_bytes, bool) or not isinstance(output_limit_bytes, int)
+                or output_limit_bytes < 1):
+            raise ValueError("output_limit_bytes must be a positive integer")
 
-        self.repo_path = path.resolve()
+        self.repo_path = workspace.source
+        self._workspace = workspace
         self.command_timeout = command_timeout
         self.max_steps = max_steps
+        self.output_limit_bytes = output_limit_bytes
         self._steps = 0
         self._truncated = False
 
     def reset(self) -> tuple[SWEObservation, dict]:
         """Start a new episode and return a top-level workspace listing."""
+        path = self._workspace.reset()
         self._steps = 0
         self._truncated = False
         try:
-            names = sorted(entry.name for entry in os.scandir(self.repo_path))
+            names = sorted(entry.name for entry in os.scandir(path))
             stdout = "\n".join(names)
             stderr = ""
             exit_code = 0
@@ -57,6 +60,7 @@ class SWEEnv:
         observation = SWEObservation(stdout, stderr, exit_code, diff)
         info = {
             "repo_path": str(self.repo_path),
+            "workspace_path": str(path),
             "step": 0,
             "git_available": git_available,
             "diff_scope": "tracked staged and unstaged changes; untracked files are omitted",
@@ -70,6 +74,8 @@ class SWEEnv:
         Reward is 0 for an exit status of 0 and -1 otherwise. This only scores
         command execution; it is not a task-completion signal.
         """
+        if self._workspace.path is None:
+            raise RuntimeError("No active episode; call reset() before stepping")
         if self._truncated:
             raise RuntimeError("Episode step limit reached; call reset() before stepping again")
         if isinstance(action, SWEAction):
@@ -78,54 +84,49 @@ class SWEEnv:
             command = action
         else:
             raise TypeError("action must be a command string or SWEAction")
+        if not isinstance(command, str):
+            raise TypeError("command must be a string")
         if not command.strip():
             raise ValueError("command must not be empty")
 
         self._steps += 1
-        timed_out = False
-        error = None
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=self.repo_path,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.command_timeout,
-                check=False,
-            )
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
-            exit_code = completed.returncode
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            stdout = self._decode_output(exc.stdout)
-            stderr = self._decode_output(exc.stderr)
-            exit_code = 124
-            error = f"Command timed out after {self.command_timeout:g} seconds"
-        except OSError as exc:
-            stdout = ""
-            stderr = str(exc)
-            exit_code = 127
-            error = str(exc)
-
+        execution = execute(command, self._workspace.path, self.command_timeout, self.output_limit_bytes)
         git_available, diff = self._git_changes()
-        observation = SWEObservation(stdout, stderr, exit_code, diff)
+        observation = SWEObservation(execution.stdout, execution.stderr, execution.exit_code, diff)
         terminated = False
         self._truncated = self._steps >= self.max_steps
-        reward = 0.0 if exit_code == 0 else -1.0
+        reward = 0.0 if execution.exit_code == 0 else -1.0
         info = {
             "command": command,
             "step": self._steps,
             "max_steps": self.max_steps,
-            "timed_out": timed_out,
-            "error": error,
+            "timed_out": execution.timed_out,
+            "error": execution.error,
+            "stdout_truncated": execution.stdout_truncated,
+            "stderr_truncated": execution.stderr_truncated,
+            "output_limit_bytes": self.output_limit_bytes,
             "git_available": git_available,
             "diff_scope": "tracked staged and unstaged changes; untracked files are omitted",
             "task_solved": None,
             "reward_basis": "command exit status only; no task-completion evaluator is configured",
         }
         return StepResult(observation, reward, terminated, self._truncated, info)
+
+    def close(self) -> None:
+        """Release the active episode; reset() is required before another step."""
+        self._workspace.close()
+
+    def __enter__(self) -> SWEEnv:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except OSError:
+                pass  # Do not hide an exception raised inside the episode.
 
     def _git_changes(self) -> tuple[bool, str]:
         probe = self._run_git(["git", "rev-parse", "--is-inside-work-tree"])
@@ -156,7 +157,7 @@ class SWEEnv:
         try:
             return subprocess.run(
                 command,
-                cwd=self.repo_path,
+                cwd=self._workspace.path,
                 capture_output=True,
                 text=True,
                 timeout=min(self.command_timeout, 5.0),
@@ -164,11 +165,3 @@ class SWEEnv:
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
-
-    @staticmethod
-    def _decode_output(output: Union[str, bytes, None]) -> str:
-        if output is None:
-            return ""
-        if isinstance(output, bytes):
-            return output.decode(errors="replace")
-        return output
