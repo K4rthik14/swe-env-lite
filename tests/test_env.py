@@ -95,6 +95,29 @@ def test_git_diff_reports_tracked_changes_without_resetting_repo(tmp_path: Path)
     assert source.read_text(encoding="utf-8") == "before\n"
 
 
+def test_non_utf8_git_diff_does_not_crash_step(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "SWEEnv Test"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "sweenv-test@example.invalid"],
+        cwd=tmp_path,
+        check=True,
+    )
+    (tmp_path / "latin.txt").write_bytes("héllo\n".encode("latin-1"))
+    subprocess.run(["git", "add", "latin.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "fixture"], cwd=tmp_path, check=True)
+    env = SWEEnv(tmp_path)
+
+    env.reset()
+    result = env.step(
+        _python("from pathlib import Path; Path('latin.txt').write_bytes(bytes([0xff, 0xfe, 0xfd]) + b'new\\n')")
+    )
+
+    assert result.info["git_available"] is True
+    assert isinstance(result.observation.diff, str)
+    assert "latin.txt" in result.observation.diff
+
+
 def test_episode_limit_truncates_until_reset(tmp_path: Path) -> None:
     env = SWEEnv(tmp_path, max_steps=1)
 
@@ -115,3 +138,35 @@ def test_invalid_path_and_action_are_rejected(tmp_path: Path) -> None:
     env.reset()
     with pytest.raises(ValueError, match="empty"):
         env.step("  ")
+
+
+def test_step_before_reset_and_reset_after_close(tmp_path: Path) -> None:
+    (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")
+    env = SWEEnv(tmp_path)
+    with pytest.raises(RuntimeError, match="reset"):
+        env.step("echo hi")
+
+    _, info = env.reset()
+    first = Path(info["workspace_path"])
+    assert first.is_dir()
+    env.close()
+    with pytest.raises(RuntimeError, match="reset"):
+        env.step("echo hi")
+
+    _, info = env.reset()
+    second = Path(info["workspace_path"])
+    assert second.is_dir() and second != first and not first.exists()
+    assert env.step("echo ok").observation.stdout.strip() == "ok"
+    env.close()
+
+
+def test_context_manager_cleans_up_on_exception(tmp_path: Path) -> None:
+    env = SWEEnv(tmp_path)
+    with pytest.raises(ValueError, match="boom"):
+        with env:
+            _, info = env.reset()
+            workspace = Path(info["workspace_path"])
+            assert workspace.is_dir()
+            raise ValueError("boom")
+    assert env._workspace.path is None
+    assert not workspace.exists()

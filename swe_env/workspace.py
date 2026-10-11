@@ -68,7 +68,7 @@ class EpisodeWorkspace:
             ],
         ]
         for command in commands:
-            subprocess.run(command, cwd=path, check=True, capture_output=True, text=True)
+            subprocess.run(command, cwd=path, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     def close(self) -> None:
         temporary = self._temporary
