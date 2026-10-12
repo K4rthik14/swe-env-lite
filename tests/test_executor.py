@@ -4,6 +4,7 @@ import os
 import shlex
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -11,11 +12,59 @@ from unittest.mock import patch
 import pytest
 
 from swe_env import SWEEnv
+from swe_env.executor import _Capture
 from swe_env.types import SWEAction
 
 
 def py(code: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+class _FdPipe:
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+
+class _ClosedPipe:
+    def fileno(self) -> int:
+        raise ValueError("I/O operation on closed file.")
+
+
+def test_capture_records_closed_pipe_without_raising() -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"partial")
+    finally:
+        os.close(write_fd)
+    capture = _Capture(1024)
+    capture.read(_FdPipe(read_fd))
+    os.close(read_fd)
+    assert capture.text() == "partial"
+    assert capture.error is None
+
+    # execute() closes pipes after a bounded join; a live reader observes this.
+    capture.read(_ClosedPipe())
+    assert capture.text() == "partial"
+    assert isinstance(capture.error, ValueError)
+
+
+def test_capture_closed_pipe_in_thread_reports_no_thread_exception() -> None:
+    capture = _Capture(1024)
+    seen: list = []
+    previous = threading.excepthook
+    threading.excepthook = lambda args: seen.append(args.exc_value)  # noqa: E731
+    try:
+        worker = threading.Thread(target=capture.read, args=(_ClosedPipe(),), daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    finally:
+        threading.excepthook = previous
+    assert seen == []
+    assert isinstance(capture.error, ValueError)
 
 
 def test_bounded_concurrent_output_and_unicode(tmp_path: Path) -> None:
@@ -86,6 +135,84 @@ def test_timeout_kills_shell_descendant(tmp_path: Path) -> None:
         else:
             os.kill(pid, signal.SIGKILL)
             pytest.fail("child still running after timeout")
+
+
+def test_timeout_captures_output_from_inherited_descendant(tmp_path: Path) -> None:
+    child = "import sys,time; sys.stdout.write('child-marker\\n'); sys.stdout.flush(); time.sleep(30)"
+    parent = f"import subprocess,sys; p=subprocess.Popen([sys.executable,'-c',{child!r}]); p.wait()"
+    with SWEEnv(tmp_path, command_timeout=1.0) as env:
+        env.reset()
+        result = env.step(py(parent))
+    assert result.info["timed_out"] is True
+    assert result.observation.exit_code == 124
+    assert "child-marker" in result.observation.stdout
+    assert result.info["error"] == "Command timed out after 1 seconds"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX sessions and /proc test")
+def test_escaped_descendant_stays_bounded_and_reports_reader_pressure(tmp_path: Path) -> None:
+    if not Path("/proc").is_dir():
+        pytest.skip("requires Linux /proc to reap the escaped child")
+    child = "import os,sys,time; os.setsid(); open('esc.pid','w').write(str(os.getpid())); sys.stdout.write('early\\n'); sys.stdout.flush(); time.sleep(30)"
+    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(30)"
+    thread_errors: list = []
+    lock = threading.Lock()
+    previous = threading.excepthook
+
+    def hook(args) -> None:
+        with lock:
+            thread_errors.append(args.exc_value)
+
+    threading.excepthook = hook
+    pid = None
+    try:
+        with SWEEnv(tmp_path, command_timeout=0.5) as env:
+            env.reset()
+            started = time.monotonic()
+            result = env.step(py(parent))
+            elapsed = time.monotonic() - started
+            pidfile = Path(env._workspace.path) / "esc.pid"
+            assert pidfile.exists()
+            pid = int(pidfile.read_text())
+        assert result.info["timed_out"] is True
+        assert result.observation.exit_code == 124
+        assert elapsed < 15
+        assert "early" in result.observation.stdout
+        assert result.info["error"] is not None
+        assert result.info["error"].count("output reader did not exit") == 1
+    finally:
+        threading.excepthook = previous
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            for _ in range(200):
+                try:
+                    if Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.5)
+    with lock:
+        assert thread_errors == []
+
+
+def test_repeated_timeouts_do_not_accumulate_threads(tmp_path: Path) -> None:
+    with SWEEnv(tmp_path, command_timeout=0.2, max_steps=10) as env:
+        env.reset()
+        baseline = threading.active_count()
+        for _ in range(3):
+            result = env.step(py("import time; time.sleep(30)"))
+            assert result.info["timed_out"] is True
+            assert result.observation.exit_code == 124
+        for _ in range(100):
+            if threading.active_count() <= baseline:
+                break
+            time.sleep(0.05)
+        assert threading.active_count() <= baseline
+        assert env.step(py("print('ok')")).observation.stdout.strip() == "ok"
 
 
 def test_cleanup_failure_disables_episode(tmp_path: Path) -> None:

@@ -27,7 +27,7 @@ class _Capture:
         self.limit = limit
         self.data = bytearray()
         self.truncated = False
-        self.error: Optional[OSError] = None
+        self.error: Optional[Exception] = None
 
     def read(self, pipe: object) -> None:
         try:
@@ -40,6 +40,11 @@ class _Capture:
                 if len(chunk) > remaining:
                     self.truncated = True
         except OSError as exc:
+            self.error = exc
+        except ValueError as exc:
+            # execute() closes pipes after a bounded join; a reader that is
+            # still alive observes the closed pipe here. Record it instead of
+            # raising an unhandled thread exception.
             self.error = exc
 
     def text(self) -> str:
@@ -136,8 +141,8 @@ def execute(command: str, cwd: Path, timeout: float, output_limit: int) -> Execu
                 pipe.close()
         for reader in readers:
             reader.join(timeout=0.1)
-            if reader.is_alive():
-                result.error = f"{result.error or 'Capture failed'}; output reader did not exit"
+        if any(reader.is_alive() for reader in readers):
+            result.error = f"{result.error or 'Capture failed'}; output reader did not exit"
     result.stdout = stdout.text()
     result.stderr = stderr.text()
     result.stdout_truncated = stdout.truncated
