@@ -13,6 +13,8 @@ from typing import Optional, Union
 
 class EpisodeWorkspace:
     def __init__(self, source: Union[str, Path]) -> None:
+        if isinstance(source, str) and source == "":
+            raise ValueError("Repository path must not be empty")
         path = Path(source).expanduser()
         try:
             resolved = path.resolve(strict=True)
@@ -35,14 +37,14 @@ class EpisodeWorkspace:
         temporary = tempfile.TemporaryDirectory(prefix="swe-env-")
         destination = Path(temporary.name) / "repo"
         try:
-            # Root Git metadata may reference external worktrees or object stores.
+            # Git metadata at any level may reference external worktrees or
+            # object stores, and nested repositories break the private
+            # baseline below. The copy therefore never contains `.git` entries.
             shutil.copytree(
                 self.source,
                 destination,
                 symlinks=True,
-                ignore=lambda directory, names: (
-                    {".git"} if Path(directory) == self.source and ".git" in names else set()
-                ),
+                ignore=lambda directory, names: {".git"} if ".git" in names else set(),
                 copy_function=self._copy_file,
             )
             if (self.source / ".git").exists() or (self.source / ".git").is_symlink():
