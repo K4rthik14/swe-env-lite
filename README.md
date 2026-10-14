@@ -2,6 +2,15 @@
 
 A small Python environment for running agent-supplied commands in a temporary copy of an existing repository. It is a lightweight scaffold, not a sandbox or a task-completion evaluator.
 
+## Install
+
+Requires Python 3.9 or newer. Git is required only for Git-backed sources.
+
+```bash
+pip install -e .
+pip install -r requirements.txt  # pytest, for running the test suite
+```
+
 ## Current behavior
 
 - `SWEEnv(repo_path)` resolves and validates the source directory without copying it yet; directory symlinks resolve to their target.
